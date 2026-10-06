@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,11 +52,26 @@ type Client struct {
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
 
+	readIdleTimeout time.Duration
+	pingTimeout     time.Duration
+	lastRead        atomic.Int64
+	pongCh          chan struct{}
+
 	interceptor UnaryClientInterceptor
 }
 
 // ClientOpts configures a client
 type ClientOpts func(c *Client)
+
+// WithClientKeepAlive configures the client connection health check using PING/PONG frames.
+// ReadIdleTimeout is the duration after which a PING frame is sent if no frames are received (0 disables keepalive).
+// PingTimeout is the duration after which the connection is closed if no PONG response is received (0 disables keepalive).
+func WithClientKeepAlive(readIdleTimeout, pingTimeout time.Duration) ClientOpts {
+	return func(c *Client) {
+		c.readIdleTimeout = readIdleTimeout
+		c.pingTimeout = pingTimeout
+	}
+}
 
 // WithOnClose sets the close func whenever the client's Close() method is called
 func WithOnClose(onClose func()) ClientOpts {
@@ -121,7 +137,9 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		pongCh:          make(chan struct{}, 1),
 	}
+	c.lastRead.Store(time.Now().UnixNano())
 
 	for _, o := range opts {
 		o(c)
@@ -338,12 +356,59 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 }
 
 func (c *Client) run() {
+	if c.readIdleTimeout > 0 && c.pingTimeout > 0 {
+		go c.keepAlive()
+	}
 	err := c.receiveLoop()
 	c.Close()
 	c.cleanupStreams(err)
 
 	c.userCloseFunc()
 	close(c.userCloseWaitCh)
+}
+
+func (c *Client) keepAlive() {
+	timer := time.NewTimer(c.readIdleTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		idle := time.Since(time.Unix(0, c.lastRead.Load()))
+		if idle < c.readIdleTimeout {
+			timer.Reset(c.readIdleTimeout - idle)
+			continue
+		}
+
+		select {
+		case <-c.pongCh:
+		default:
+		}
+
+		if err := c.send(0, messageTypePing, 0, nil); err != nil {
+			c.Close()
+			return
+		}
+
+		timer.Reset(c.pingTimeout)
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.pongCh:
+			timer.Reset(c.readIdleTimeout)
+		case <-timer.C:
+			if time.Since(time.Unix(0, c.lastRead.Load())) >= c.pingTimeout {
+				log.G(c.ctx).Error("ttrpc: keepalive ping timeout, closing client connection")
+				c.Close()
+				return
+			}
+			timer.Reset(c.readIdleTimeout)
+		}
+	}
 }
 
 func (c *Client) receiveLoop() error {
@@ -366,9 +431,26 @@ func (c *Client) receiveLoop() error {
 					return filterCloseErr(err)
 				}
 			}
+			c.lastRead.Store(time.Now().UnixNano())
+			switch msg.header.Type {
+			case messageTypePing:
+				c.channel.putmbuf(msg.payload)
+				if err := c.send(msg.header.StreamID, messageTypePong, 0, nil); err != nil {
+					return filterCloseErr(err)
+				}
+				continue
+			case messageTypePong:
+				c.channel.putmbuf(msg.payload)
+				select {
+				case c.pongCh <- struct{}{}:
+				default:
+				}
+				continue
+			}
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				c.channel.putmbuf(msg.payload)
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}

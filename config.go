@@ -19,11 +19,28 @@ package ttrpc
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker      Handshaker
+	interceptor     UnaryServerInterceptor
+	readIdleTimeout time.Duration
+	pingTimeout     time.Duration
+}
+
+// WithServerKeepAlive configures the server connection health check using PING/PONG frames.
+// ReadIdleTimeout is the duration after which a PING frame is sent if no frames are received (0 disables keepalive).
+// PingTimeout is the duration after which the connection is closed if no PONG response is received (0 disables keepalive).
+func WithServerKeepAlive(readIdleTimeout, pingTimeout time.Duration) ServerOpt {
+	return func(c *serverConfig) error {
+		if readIdleTimeout < 0 || pingTimeout < 0 {
+			return errors.New("keepalive timeouts must be non-negative")
+		}
+		c.readIdleTimeout = readIdleTimeout
+		c.pingTimeout = pingTimeout
+		return nil
+	}
 }
 
 // ServerOpt for configuring a ttrpc server

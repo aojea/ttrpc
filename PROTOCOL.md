@@ -56,6 +56,8 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Ping     | Check if connection is alive     |
+| 0x05         | Pong     | Response to a Ping message       |
 
 ### Request
 
@@ -109,6 +111,17 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Ping
+
+The ping message is a connection-level frame (Stream ID 0, empty flags, empty payload)
+sent by either the client or the server to verify that the remote peer is still alive
+when no frames have been received within the configured `ReadIdleTimeout`.
+
+### Pong
+
+The pong message is a connection-level frame (Stream ID 0, empty flags, empty payload)
+sent immediately in response to a `Ping` message to confirm that the connection is active.
 
 ## Streaming
 

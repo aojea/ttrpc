@@ -341,12 +341,18 @@ func (c *serverConn) run(sctx context.Context) {
 		ctx, cancel            = context.WithCancel(sctx)
 		state        connState = connStateIdle
 		responses              = make(chan response)
+		pings                  = make(chan uint32, 1)
+		pongCh                 = make(chan struct{}, 1)
+		sendPing               = make(chan struct{}, 1)
+		pingTimedOut           = make(chan struct{}, 1)
 		recvErr                = make(chan error, 1)
 		done                   = make(chan struct{})
 		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
+		lastRead     atomic.Int64
 	)
+	lastRead.Store(time.Now().UnixNano())
 
 	defer c.conn.Close()
 	defer cancel()
@@ -396,6 +402,28 @@ func (c *serverConn) run(sctx context.Context) {
 					return
 				}
 
+				continue
+			}
+
+			lastRead.Store(time.Now().UnixNano())
+
+			switch mh.Type {
+			case messageTypePing:
+				ch.putmbuf(p)
+				select {
+				case pings <- mh.StreamID:
+				case <-c.shutdown:
+					return
+				case <-done:
+					return
+				}
+				continue
+			case messageTypePong:
+				ch.putmbuf(p)
+				select {
+				case pongCh <- struct{}{}:
+				default:
+				}
 				continue
 			}
 
@@ -494,6 +522,61 @@ func (c *serverConn) run(sctx context.Context) {
 		}
 	}(recvErr)
 
+	if c.server.config.readIdleTimeout > 0 && c.server.config.pingTimeout > 0 {
+		go func(readIdleTimeout, pingTimeout time.Duration) {
+			timer := time.NewTimer(readIdleTimeout)
+			defer timer.Stop()
+
+			for {
+				select {
+				case <-c.shutdown:
+					return
+				case <-done:
+					return
+				case <-timer.C:
+				}
+
+				idle := time.Since(time.Unix(0, lastRead.Load()))
+				if idle < readIdleTimeout {
+					timer.Reset(readIdleTimeout - idle)
+					continue
+				}
+
+				select {
+				case <-pongCh:
+				default:
+				}
+
+				select {
+				case sendPing <- struct{}{}:
+				case <-c.shutdown:
+					return
+				case <-done:
+					return
+				}
+
+				timer.Reset(pingTimeout)
+				select {
+				case <-c.shutdown:
+					return
+				case <-done:
+					return
+				case <-pongCh:
+					timer.Reset(readIdleTimeout)
+				case <-timer.C:
+					if time.Since(time.Unix(0, lastRead.Load())) >= pingTimeout {
+						select {
+						case pingTimedOut <- struct{}{}:
+						default:
+						}
+						return
+					}
+					timer.Reset(readIdleTimeout)
+				}
+			}
+		}(c.server.config.readIdleTimeout, c.server.config.pingTimeout)
+	}
+
 	for {
 		var (
 			newstate connState
@@ -562,6 +645,19 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 			log.G(ctx).WithError(err).Error("error receiving message")
 			// else, initiate shutdown
+		case streamID := <-pings:
+			if err := ch.send(streamID, messageTypePong, 0, nil); err != nil {
+				log.G(ctx).WithError(err).Error("failed sending pong on channel")
+				return
+			}
+		case <-sendPing:
+			if err := ch.send(0, messageTypePing, 0, nil); err != nil {
+				log.G(ctx).WithError(err).Error("failed sending ping on channel")
+				return
+			}
+		case <-pingTimedOut:
+			log.G(ctx).Error("ttrpc: keepalive ping timeout, closing server connection")
+			return
 		case <-shutdown:
 			return
 		}

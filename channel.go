@@ -39,6 +39,8 @@ const (
 	messageTypeRequest  messageType = 0x1
 	messageTypeResponse messageType = 0x2
 	messageTypeData     messageType = 0x3
+	messageTypePing     messageType = 0x4
+	messageTypePong     messageType = 0x5
 )
 
 func (mt messageType) String() string {
@@ -49,6 +51,10 @@ func (mt messageType) String() string {
 		return "response"
 	case messageTypeData:
 		return "data"
+	case messageTypePing:
+		return "ping"
+	case messageTypePong:
+		return "pong"
 	default:
 		return "unknown"
 	}
